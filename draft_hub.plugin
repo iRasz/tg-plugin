@@ -1,0 +1,762 @@
+import json
+import time
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook, MenuItemData, MenuItemType
+from android_utils import run_on_ui_thread, log
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment, send_message
+from ui.settings import Header, Switch, Input, Divider, Text
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from java import dynamic_proxy, jclass
+
+__id__ = "draft_hub"
+__name__ = "Draft Hub"
+__description__ = "Kelola draft pesan, tandai chat, dan kirim satu chat atau broadcast dari satu tombol di bar ketik."
+__author__ = "@iRaszz"
+__version__ = "1.0.0"
+__min_version__ = "11.12.0"
+
+GOLD = 0xFFFFB300
+GOLD_TEXT = 0xFFE09A00
+STAR_ON = "\u2605"
+STAR_OFF = "\u2606"
+TITLE_MARK = " \u2605"
+TAG_BTN = "dm_btn"
+
+_CACHE = {}
+
+
+def raw(name):
+    if name not in _CACHE:
+        try:
+            _CACHE[name] = find_class(name)
+        except Exception:
+            _CACHE[name] = None
+    return _CACHE[name]
+
+
+def J(name):
+    c = raw(name)
+    if c is None:
+        return jclass(name)
+    if hasattr(c, "getSimpleName"):
+        return jclass(str(c.getName()))
+    return c
+
+
+def col(v):
+    v = int(v) & 0xFFFFFFFF
+    if v >= 0x80000000:
+        return v - 0x100000000
+    return v
+
+
+def alpha(c, a):
+    return col(((int(a) & 255) << 24) | (int(c) & 0xFFFFFF))
+
+
+def dp(v):
+    return int(J("org.telegram.messenger.AndroidUtilities").dp(float(v)))
+
+
+def tc(keys, default):
+    if isinstance(keys, str):
+        keys = [keys]
+    try:
+        theme = J("org.telegram.ui.ActionBar.Theme")
+    except Exception:
+        return col(default)
+    for k in keys:
+        try:
+            return int(theme.getColor(getattr(theme, k)))
+        except Exception:
+            continue
+    return col(default)
+
+
+class Click(dynamic_proxy(J("android.view.View$OnClickListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        try:
+            self.fn(v)
+        except Exception as e:
+            log("draft_hub click error: " + str(e))
+
+
+def rounded(color, radius, stroke=None):
+    g = J("android.graphics.drawable.GradientDrawable")()
+    g.setColor(col(color))
+    g.setCornerRadius(float(dp(radius)))
+    if stroke is not None:
+        g.setStroke(dp(1), col(stroke))
+    return g
+
+
+def lp(w=-1, h=-2, weight=None, l=0, t=0, r=0, b=0):
+    P = J("android.widget.LinearLayout$LayoutParams")
+    p = P(w, h) if weight is None else P(w, h, float(weight))
+    p.setMargins(dp(l), dp(t), dp(r), dp(b))
+    return p
+
+
+def label(ctx, text, size, color, bold=False):
+    t = J("android.widget.TextView")(ctx)
+    t.setText(str(text))
+    t.setTextSize(float(size))
+    t.setTextColor(col(color))
+    if bold:
+        t.setTypeface(J("android.graphics.Typeface").DEFAULT_BOLD)
+    return t
+
+
+def button(ctx, text, fg, bg, fn):
+    t = label(ctx, text, 14, fg, True)
+    t.setGravity(17)
+    t.setPadding(dp(12), dp(10), dp(12), dp(10))
+    t.setBackground(rounded(bg, 10))
+    t.setOnClickListener(Click(fn))
+    return t
+
+
+def hrow(ctx):
+    r = J("android.widget.LinearLayout")(ctx)
+    r.setOrientation(0)
+    r.setGravity(16)
+    return r
+
+
+def vbox(ctx):
+    r = J("android.widget.LinearLayout")(ctx)
+    r.setOrientation(1)
+    return r
+
+
+def field(ctx, hint, text, lines, txt, gray, card):
+    e = J("android.widget.EditText")(ctx)
+    e.setHint(hint)
+    e.setText(text)
+    e.setTextColor(col(txt))
+    e.setHintTextColor(col(gray))
+    e.setTextSize(15.0)
+    e.setBackground(rounded(card, 10))
+    e.setPadding(dp(12), dp(10), dp(12), dp(10))
+    if lines <= 1:
+        e.setSingleLine(True)
+    else:
+        e.setInputType(1 | 16384 | 131072)
+        e.setMinLines(lines)
+        e.setMaxLines(8)
+        e.setGravity(51)
+    return e
+
+
+def icon_res(ctx):
+    res = ctx.getResources()
+    pkg = ctx.getPackageName()
+    for n in ["msg_edit", "msg_saved", "msg_text_outlined"]:
+        try:
+            i = int(res.getIdentifier(n, "drawable", pkg))
+            if i:
+                return i
+        except Exception:
+            continue
+    return int(J("android.R$drawable").ic_menu_edit)
+
+
+class ChatHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.p = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.p.ensure_button(param.thisObject)
+        except Exception as e:
+            log("draft_hub chat hook error: " + str(e))
+
+
+class TitleHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.p = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            if len(args) < 1:
+                return
+            t = args[0]
+            if not isinstance(t, str):
+                return
+            if not bool(self.p.get_setting("title_mark", True)):
+                return
+            frag = get_private_field(param.thisObject, "parentFragment")
+            if frag is None:
+                return
+            if "ChatActivity" not in str(frag.getClass().getName()):
+                return
+            did = int(frag.getDialogId())
+            if self.p.is_marked(did) and not t.endswith(TITLE_MARK):
+                args[0] = t + TITLE_MARK
+        except Exception:
+            pass
+
+
+class DraftHubPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.sheet = None
+        self.dlg = None
+        self.send_btns = []
+        self.add_on_send_message_hook()
+        try:
+            chat_cls = raw("org.telegram.ui.ChatActivity")
+            hook = ChatHook(self)
+            self.hook_all_methods(chat_cls, "createView", hook)
+            self.hook_all_methods(chat_cls, "onResume", hook)
+        except Exception as e:
+            log("draft_hub hook chat failed: " + str(e))
+        try:
+            avatar_cls = raw("org.telegram.ui.Components.ChatAvatarContainer")
+            if avatar_cls is None:
+                avatar_cls = raw("org.telegram.ui.ChatAvatarContainer")
+            if avatar_cls is not None:
+                self.hook_all_methods(avatar_cls, "setTitle", TitleHook(self))
+        except Exception as e:
+            log("draft_hub hook title failed: " + str(e))
+        self.add_item(MenuItemType.MESSAGE_CONTEXT_MENU, "Simpan ke Draft", self.menu_save, "draft_hub_save", "msg_edit")
+        action_menu = getattr(MenuItemType, "CHAT_ACTION_MENU", None)
+        if action_menu is not None:
+            self.add_item(action_menu, "Draft Hub", self.menu_open, "draft_hub_open", "msg_edit")
+
+    def on_plugin_unload(self):
+        self.close_sheet()
+        self.close_dlg()
+
+    def add_item(self, mtype, text, fn, iid, icon):
+        try:
+            self.add_menu_item(MenuItemData(menu_type=mtype, text=text, on_click=fn, item_id=iid, icon=icon))
+        except Exception:
+            try:
+                self.add_menu_item(MenuItemData(menu_type=mtype, text=text, on_click=fn))
+            except Exception as e:
+                log("draft_hub menu failed: " + str(e))
+
+    def on_send_message_hook(self, account, params):
+        try:
+            if str(params.message).strip().lower() == ".draft":
+                run_on_ui_thread(lambda: self.show_panel())
+                return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception:
+            pass
+        return HookResult()
+
+    def create_settings(self):
+        return [
+            Header(text="Tampilan"),
+            Switch(
+                key="show_button",
+                text="Tombol di bar chat",
+                default=True,
+                subtext="Tampilkan tombol Draft Hub di samping bar ketik",
+                on_change=lambda v: run_on_ui_thread(lambda: self.refresh_button()),
+            ),
+            Switch(
+                key="title_mark",
+                text="Tanda bintang di judul",
+                default=True,
+                subtext="Tambahkan bintang pada judul room yang ditandai",
+            ),
+            Header(text="Broadcast"),
+            Input(
+                key="broadcast_delay",
+                text="Jeda pengiriman (ms)",
+                default="1000",
+                subtext="Jeda antar chat saat broadcast, minimal 200 ms",
+            ),
+            Divider(text="Akses cadangan: ketik .draft atau pakai menu titik tiga chat"),
+            Text(text="Hapus semua penanda chat", red=True, on_click=lambda v: self.clear_marks()),
+        ]
+
+    def clear_marks(self):
+        self.save("marks", [])
+        BulletinHelper.show_success("Semua penanda dihapus")
+        run_on_ui_thread(lambda: self.refresh_button())
+
+    def load(self, key):
+        try:
+            v = json.loads(str(self.get_setting(key, "[]")))
+            if isinstance(v, list):
+                return v
+        except Exception:
+            pass
+        return []
+
+    def save(self, key, value):
+        self.set_setting(key, json.dumps(value, ensure_ascii=False))
+
+    def marks(self):
+        return self.load("marks")
+
+    def drafts(self):
+        return self.load("drafts")
+
+    def is_marked(self, did):
+        try:
+            for m in self.marks():
+                if int(m.get("id")) == int(did):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def broadcast(self):
+        return bool(self.get_setting("broadcast_mode", False))
+
+    def delay(self):
+        try:
+            v = int(str(self.get_setting("broadcast_delay", "1000")).strip())
+        except Exception:
+            v = 1000
+        return max(200, min(v, 60000))
+
+    def chat_frag(self):
+        try:
+            f = get_last_fragment()
+            if f is not None and "ChatActivity" in str(f.getClass().getName()):
+                return f
+        except Exception:
+            pass
+        return None
+
+    def cur_dialog(self):
+        f = self.chat_frag()
+        if f is None:
+            return None
+        try:
+            return int(f.getDialogId())
+        except Exception:
+            return None
+
+    def chat_title(self, f):
+        try:
+            ch = f.getCurrentChat()
+            if ch is not None:
+                return str(ch.title)
+            u = f.getCurrentUser()
+            if u is not None:
+                return str(J("org.telegram.messenger.UserObject").getUserName(u))
+        except Exception:
+            pass
+        try:
+            return str(f.getDialogId())
+        except Exception:
+            return "Chat"
+
+    def ctx_now(self):
+        try:
+            f = get_last_fragment()
+            if f is not None:
+                return f.getParentActivity()
+        except Exception:
+            pass
+        return None
+
+    def ensure_button(self, f):
+        ev = get_private_field(f, "chatActivityEnterView")
+        if ev is None:
+            return
+        ctx = f.getParentActivity()
+        if ctx is None:
+            return
+        host = get_private_field(ev, "attachLayout")
+        target = host if host is not None else ev
+        view = target.findViewWithTag(TAG_BTN)
+        show = bool(self.get_setting("show_button", True))
+        did = int(f.getDialogId())
+        if self.is_marked(did):
+            color = GOLD
+        else:
+            color = tc(["key_chat_messagePanelIcons"], 0xFF8E8E93)
+        if view is not None:
+            view.setVisibility(0 if show else 8)
+            view.setColorFilter(col(color))
+            return
+        if not show:
+            return
+        iv = J("android.widget.ImageView")(ctx)
+        iv.setTag(TAG_BTN)
+        iv.setScaleType(J("android.widget.ImageView$ScaleType").CENTER)
+        iv.setImageResource(icon_res(ctx))
+        iv.setColorFilter(col(color))
+        iv.setOnClickListener(Click(lambda v: self.show_panel()))
+        try:
+            iv.setBackground(J("org.telegram.ui.ActionBar.Theme").createSelectorDrawable(alpha(color, 0x22), 1))
+        except Exception:
+            pass
+        if host is not None:
+            host.addView(iv, 0, J("android.widget.LinearLayout$LayoutParams")(dp(40), dp(48)))
+        else:
+            flp = J("android.widget.FrameLayout$LayoutParams")(dp(40), dp(48), 85)
+            flp.setMargins(0, 0, dp(96), 0)
+            ev.addView(iv, flp)
+
+    def refresh_button(self):
+        f = self.chat_frag()
+        if f is not None:
+            try:
+                self.ensure_button(f)
+            except Exception as e:
+                log("draft_hub refresh error: " + str(e))
+
+    def refresh_title(self, f):
+        try:
+            m = f.getClass().getDeclaredMethod("updateTitle")
+            m.setAccessible(True)
+            m.invoke(f)
+        except Exception:
+            pass
+
+    def close_sheet(self):
+        try:
+            if self.sheet is not None:
+                self.sheet.dismiss()
+        except Exception:
+            pass
+        self.sheet = None
+
+    def close_dlg(self):
+        try:
+            if self.dlg is not None:
+                self.dlg.dismiss()
+        except Exception:
+            pass
+        self.dlg = None
+
+    def send_label(self):
+        if self.broadcast():
+            return "Kirim ke " + str(len(self.marks())) + " chat"
+        return "Kirim"
+
+    def on_toggle_broadcast(self, v):
+        self.set_setting("broadcast_mode", bool(v.isChecked()))
+        for b in list(self.send_btns):
+            try:
+                b.setText(self.send_label())
+            except Exception:
+                pass
+
+    def show_panel(self, ctx=None):
+        if ctx is None:
+            ctx = self.ctx_now()
+        if ctx is None:
+            return
+        self.close_sheet()
+        view = self.build_panel(ctx)
+        try:
+            builder = J("org.telegram.ui.ActionBar.BottomSheet$Builder")(ctx)
+            builder.setCustomView(view)
+            self.sheet = builder.show()
+        except Exception as e:
+            log("draft_hub sheet failed: " + str(e))
+            try:
+                b = AlertDialogBuilder(ctx)
+                b.set_title("Draft Hub")
+                b.set_view(view)
+                b.set_positive_button("Tutup", lambda bb, w: None)
+                self.dlg = b
+                b.show()
+            except Exception as e2:
+                log("draft_hub dialog failed: " + str(e2))
+
+    def build_panel(self, ctx):
+        txt = tc(["key_dialogTextBlack"], 0xFF000000)
+        gray = tc(["key_dialogTextGray2", "key_windowBackgroundWhiteGrayText"], 0xFF8E8E93)
+        accent = tc(["key_featuredStickers_addButton", "key_dialogTextBlue", "key_chat_messagePanelSend"], 0xFF2AABEE)
+        card = tc(["key_dialogBackgroundGray", "key_windowBackgroundGray"], 0xFFF1F1F4)
+        red = tc(["key_text_RedBold", "key_dialogTextRed", "key_text_RedRegular"], 0xFFE53935)
+        white = col(0xFFFFFFFF)
+        soft = alpha(accent, 0x26)
+        soft_red = alpha(red, 0x22)
+
+        f = self.chat_frag()
+        did = None
+        name = ""
+        if f is not None:
+            try:
+                did = int(f.getDialogId())
+                name = self.chat_title(f)
+            except Exception:
+                did = None
+        marked = did is not None and self.is_marked(did)
+        marks = self.marks()
+        drafts = self.drafts()
+        self.send_btns = []
+
+        root = vbox(ctx)
+        root.setPadding(dp(16), dp(10), dp(16), dp(20))
+
+        root.addView(label(ctx, "Draft Hub", 20, txt, True), lp())
+        if did is None:
+            sub = label(ctx, "Buka room chat untuk mengirim draft", 13, gray)
+        elif marked:
+            sub = label(ctx, STAR_ON + " " + name + " (ditandai)", 13, GOLD_TEXT, True)
+        else:
+            sub = label(ctx, name, 13, gray)
+        sub.setSingleLine(True)
+        root.addView(sub, lp(t=2, b=12))
+
+        actions = hrow(ctx)
+        if marked:
+            mb = button(ctx, STAR_ON + " Hapus tanda", GOLD_TEXT, alpha(GOLD, 0x30), lambda v: self.toggle_mark(ctx))
+        else:
+            mb = button(ctx, STAR_OFF + " Tandai chat", accent, soft, lambda v: self.toggle_mark(ctx))
+        actions.addView(mb, lp(0, -2, weight=1, r=6))
+        lb = button(ctx, "Chat ditandai (" + str(len(marks)) + ")", accent, soft, lambda v: self.open_marked(ctx))
+        actions.addView(lb, lp(0, -2, weight=1, l=6))
+        root.addView(actions, lp())
+
+        box = vbox(ctx)
+        box.setBackground(rounded(card, 14))
+        box.setPadding(dp(12), dp(8), dp(12), dp(10))
+        cb = J("android.widget.CheckBox")(ctx)
+        cb.setText("Kirim ke semua chat ditandai")
+        cb.setTextColor(col(txt))
+        cb.setTextSize(15.0)
+        cb.setChecked(self.broadcast())
+        try:
+            cb.setButtonTintList(J("android.content.res.ColorStateList").valueOf(col(accent)))
+        except Exception:
+            pass
+        cb.setOnClickListener(Click(lambda v: self.on_toggle_broadcast(v)))
+        box.addView(cb, lp())
+        hint = "Tidak dicentang: hanya chat ini. Dicentang: semua chat ditandai dengan jeda " + str(self.delay()) + " ms"
+        box.addView(label(ctx, hint, 12, gray), lp(l=4))
+        root.addView(box, lp(t=12))
+
+        head = hrow(ctx)
+        head.addView(label(ctx, "Draft (" + str(len(drafts)) + ")", 16, txt, True), lp(0, -2, weight=1))
+        head.addView(button(ctx, "+ Baru", white, accent, lambda v: self.open_form(ctx, None, "", "", True)), lp(-2, -2))
+        root.addView(head, lp(t=16, b=8))
+
+        if not drafts:
+            empty = label(ctx, "Belum ada draft. Ketuk + Baru atau tahan pesan di chat lalu pilih Simpan ke Draft.", 13, gray)
+            empty.setGravity(17)
+            empty.setPadding(dp(12), dp(20), dp(12), dp(20))
+            empty.setBackground(rounded(card, 14))
+            root.addView(empty, lp())
+
+        for d in drafts:
+            c = vbox(ctx)
+            c.setPadding(dp(14), dp(12), dp(14), dp(12))
+            c.setBackground(rounded(card, 14))
+            title = label(ctx, d.get("title", ""), 16, txt, True)
+            title.setSingleLine(True)
+            c.addView(title, lp())
+            pv = label(ctx, d.get("text", ""), 14, gray)
+            pv.setMaxLines(3)
+            pv.setEllipsize(J("android.text.TextUtils$TruncateAt").END)
+            c.addView(pv, lp(t=4, b=10))
+            br = hrow(ctx)
+            sb = button(ctx, self.send_label(), white, accent, lambda v, d=d: self.send_draft(d))
+            self.send_btns.append(sb)
+            br.addView(sb, lp(0, -2, weight=2, r=6))
+            eb = button(ctx, "Edit", accent, soft, lambda v, d=d: self.edit_draft(ctx, d))
+            br.addView(eb, lp(0, -2, weight=1, r=6))
+            db = button(ctx, "Hapus", red, soft_red, lambda v, d=d: self.confirm_delete(ctx, d))
+            br.addView(db, lp(0, -2, weight=1))
+            c.addView(br, lp())
+            root.addView(c, lp(b=10))
+
+        sv = J("android.widget.ScrollView")(ctx)
+        sv.addView(root)
+        return sv
+
+    def toggle_mark(self, ctx):
+        f = self.chat_frag()
+        if f is None:
+            BulletinHelper.show_error("Buka room chat terlebih dahulu")
+            return
+        did = int(f.getDialogId())
+        marks = self.marks()
+        if self.is_marked(did):
+            marks = [m for m in marks if int(m.get("id")) != did]
+            BulletinHelper.show_info("Tanda dihapus")
+        else:
+            marks.append({"id": did, "title": self.chat_title(f)})
+            BulletinHelper.show_success("Chat ditandai")
+        self.save("marks", marks)
+        self.refresh_button()
+        self.refresh_title(f)
+        self.show_panel(ctx)
+
+    def open_marked(self, ctx):
+        self.close_sheet()
+        self.close_dlg()
+        txt = tc(["key_dialogTextBlack"], 0xFF000000)
+        gray = tc(["key_dialogTextGray2", "key_windowBackgroundWhiteGrayText"], 0xFF8E8E93)
+        red = tc(["key_text_RedBold", "key_dialogTextRed", "key_text_RedRegular"], 0xFFE53935)
+        marks = self.marks()
+        box = vbox(ctx)
+        box.setPadding(dp(20), dp(4), dp(20), dp(8))
+        if not marks:
+            box.addView(label(ctx, "Belum ada chat yang ditandai.", 14, gray), lp(t=8, b=8))
+        for m in marks:
+            row = hrow(ctx)
+            row.setPadding(0, dp(8), 0, dp(8))
+            t = label(ctx, STAR_ON + " " + str(m.get("title", m.get("id"))), 15, txt)
+            t.setSingleLine(True)
+            row.addView(t, lp(0, -2, weight=1))
+            rm = label(ctx, "Hapus", 14, red, True)
+            rm.setPadding(dp(10), dp(6), dp(4), dp(6))
+            rm.setOnClickListener(Click(lambda v, mid=m.get("id"): self.remove_mark(ctx, mid)))
+            row.addView(rm, lp(-2, -2))
+            box.addView(row, lp())
+        sv = J("android.widget.ScrollView")(ctx)
+        sv.addView(box)
+        b = AlertDialogBuilder(ctx)
+        b.set_title("Chat Ditandai")
+        b.set_view(sv)
+        b.set_positive_button("Tutup", lambda bb, w: run_on_ui_thread(lambda: self.show_panel(ctx), 150))
+        if marks:
+            b.set_neutral_button("Hapus Semua", lambda bb, w: self.clear_all_marks(ctx))
+        self.dlg = b
+        b.show()
+
+    def remove_mark(self, ctx, mid):
+        self.save("marks", [m for m in self.marks() if str(m.get("id")) != str(mid)])
+        self.refresh_button()
+        f = self.chat_frag()
+        if f is not None:
+            self.refresh_title(f)
+        self.close_dlg()
+        run_on_ui_thread(lambda: self.open_marked(ctx), 150)
+
+    def clear_all_marks(self, ctx):
+        self.save("marks", [])
+        self.refresh_button()
+        f = self.chat_frag()
+        if f is not None:
+            self.refresh_title(f)
+        BulletinHelper.show_info("Semua penanda dihapus")
+        run_on_ui_thread(lambda: self.show_panel(ctx), 150)
+
+    def edit_draft(self, ctx, d):
+        self.close_sheet()
+        self.open_form(ctx, d.get("id"), d.get("title", ""), d.get("text", ""), True)
+
+    def open_form(self, ctx, draft_id, title, text, reopen):
+        self.close_sheet()
+        txt = tc(["key_dialogTextBlack"], 0xFF000000)
+        gray = tc(["key_dialogTextGray2", "key_windowBackgroundWhiteGrayText"], 0xFF8E8E93)
+        card = tc(["key_dialogBackgroundGray", "key_windowBackgroundGray"], 0xFFF1F1F4)
+        box = vbox(ctx)
+        box.setPadding(dp(20), dp(4), dp(20), dp(8))
+        et_title = field(ctx, "Judul draft", title, 1, txt, gray, card)
+        et_text = field(ctx, "Isi pesan", text, 5, txt, gray, card)
+        box.addView(et_title, lp(b=10))
+        box.addView(et_text, lp())
+        b = AlertDialogBuilder(ctx)
+        b.set_title("Draft Baru" if draft_id is None else "Edit Draft")
+        b.set_view(box)
+        b.set_positive_button(
+            "Simpan",
+            lambda bb, w: self.submit_form(ctx, draft_id, str(et_title.getText()), str(et_text.getText()), reopen),
+        )
+        b.set_negative_button("Batal", lambda bb, w: self.after_form(ctx, reopen))
+        self.dlg = b
+        b.show()
+
+    def after_form(self, ctx, reopen):
+        if reopen:
+            run_on_ui_thread(lambda: self.show_panel(ctx), 150)
+
+    def submit_form(self, ctx, draft_id, title, text, reopen):
+        title = title.strip()
+        text = text.strip()
+        if not text:
+            BulletinHelper.show_error("Isi pesan tidak boleh kosong")
+            run_on_ui_thread(lambda: self.open_form(ctx, draft_id, title, text, reopen), 200)
+            return
+        if not title:
+            title = text.replace(chr(10), " ")[:28]
+        drafts = self.drafts()
+        if draft_id is None:
+            drafts.append({"id": str(int(time.time() * 1000)), "title": title, "text": text})
+        else:
+            for d in drafts:
+                if str(d.get("id")) == str(draft_id):
+                    d["title"] = title
+                    d["text"] = text
+        self.save("drafts", drafts)
+        BulletinHelper.show_success("Draft disimpan")
+        self.after_form(ctx, reopen)
+
+    def confirm_delete(self, ctx, d):
+        self.close_sheet()
+        b = AlertDialogBuilder(ctx)
+        b.set_title("Hapus draft?")
+        b.set_message(str(d.get("title", "")))
+        b.set_positive_button("Hapus", lambda bb, w: self.delete_draft(ctx, d))
+        b.set_negative_button("Batal", lambda bb, w: self.after_form(ctx, True))
+        self.dlg = b
+        b.show()
+
+    def delete_draft(self, ctx, d):
+        self.save("drafts", [x for x in self.drafts() if str(x.get("id")) != str(d.get("id"))])
+        BulletinHelper.show_info("Draft dihapus")
+        self.after_form(ctx, True)
+
+    def send_draft(self, d):
+        text = str(d.get("text", ""))
+        if not text:
+            BulletinHelper.show_error("Draft kosong")
+            return
+        if self.broadcast():
+            targets = [int(m.get("id")) for m in self.marks()]
+            if not targets:
+                BulletinHelper.show_error("Belum ada chat yang ditandai")
+                return
+        else:
+            did = self.cur_dialog()
+            if did is None:
+                BulletinHelper.show_error("Buka room chat terlebih dahulu")
+                return
+            targets = [did]
+        gap = self.delay()
+        self.close_sheet()
+        for i, t in enumerate(targets):
+            run_on_ui_thread(lambda t=t: self.deliver(t, text), i * gap)
+        if len(targets) > 1:
+            BulletinHelper.show_info("Mengirim ke " + str(len(targets)) + " chat")
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Broadcast selesai"), len(targets) * gap + 300)
+
+    def deliver(self, did, text):
+        try:
+            send_message({"peer": int(did), "message": text})
+        except Exception as e:
+            log("draft_hub send error: " + str(e))
+
+    def menu_open(self, context):
+        run_on_ui_thread(lambda: self.show_panel())
+
+    def menu_save(self, context):
+        text = ""
+        try:
+            msg = context.get("message")
+            if msg is not None:
+                v = msg.messageOwner.message
+                if v is not None:
+                    text = str(v)
+                if not text:
+                    mt = msg.messageText
+                    if mt is not None:
+                        text = str(mt)
+        except Exception as e:
+            log("draft_hub read message error: " + str(e))
+        if not text.strip():
+            BulletinHelper.show_error("Pesan ini tidak memiliki teks")
+            return
+        run_on_ui_thread(lambda: self.open_form(self.ctx_now(), None, "", text, False))
