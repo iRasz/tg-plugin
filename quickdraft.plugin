@@ -1,0 +1,1019 @@
+import json
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from hook_utils import find_class
+from ui.settings import Divider, Text, Input, Switch
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from client_utils import get_last_fragment, get_messages_controller
+from android_utils import run_on_ui_thread, OnClickListener
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper
+from org.telegram.messenger import AndroidUtilities
+from android.view import Gravity
+from android.widget import TextView, ImageView
+
+LinearLayout = find_class("android.widget.LinearLayout")
+ScrollView = find_class("android.widget.ScrollView")
+EditText = find_class("android.widget.EditText")
+CheckBox = find_class("android.widget.CheckBox")
+GradientDrawable = find_class("android.graphics.drawable.GradientDrawable")
+ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+
+__id__ = "quickdraft"
+__name__ = "Quick Draft & Broadcast"
+__description__ = (
+    "Tombol cepat di bar chat untuk kelola draft pesan, tandai chat/grup dengan indikator visual, "
+    "dan kirim pesan ke satu room atau ke semua chat yang ditandai secara bersamaan."
+)
+__author__ = "@ihearing"
+__version__ = "2.0.1"
+__min_version__ = "11.0.0"
+
+
+class EnterViewHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            enter_view = param.thisObject
+            if enter_view is not None:
+                self.plugin._attach_bar_button(enter_view)
+                self.plugin._refresh_visual_indicators()
+        except Exception:
+            pass
+
+
+class AvatarTitleHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            container = param.thisObject
+            if container is not None:
+                self.plugin._apply_header_badge(container)
+        except Exception:
+            pass
+
+
+class QuickDraftPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.menu_draft_id = None
+        self.ctx_save_draft_id = None
+        self.hook_enter_delegate_ref = None
+        self.hook_enter_attach_ref = None
+        self.hook_avatar_title_ref = None
+        self._broadcast_to_marked = False
+        self._bar_btn_tag = "quickdraft_action_btn"
+        self._badge_prefix = "📌 "
+
+    def _get_drafts(self):
+        try:
+            raw = self.get_setting("saved_drafts_json", "")
+            if not raw:
+                defaults = [
+                    {
+                        "title": "Contoh Promo",
+                        "text": "Ready Akun Tele Old ID 1 & Jasa Ganti Nomor Luar Negeri."
+                    }
+                ]
+                self._save_drafts(defaults)
+                return defaults
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_drafts(self, drafts):
+        try:
+            self.set_setting("saved_drafts_json", json.dumps(drafts, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _get_marked_chats(self):
+        try:
+            raw = self.get_setting("marked_chats_json", "[]")
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_marked_chats(self, chats):
+        try:
+            self.set_setting("marked_chats_json", json.dumps(chats, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _is_chat_marked(self, dialog_id):
+        if dialog_id is None:
+            return False
+        target = str(dialog_id)
+        for item in self._get_marked_chats():
+            if str(item.get("id")) == target:
+                return True
+        return False
+
+    def _resolve_drawable_id(self, name):
+        try:
+            ctx = ApplicationLoader.applicationContext if ApplicationLoader else None
+            if ctx is None:
+                return 0
+            return ctx.getResources().getIdentifier(name, "drawable", ctx.getPackageName())
+        except Exception:
+            return 0
+
+    def _get_current_dialog_info(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return None, None
+            dialog_id = int(fragment.getDialogId())
+            if not dialog_id:
+                return None, None
+            title = self._resolve_dialog_title(dialog_id)
+            return dialog_id, title
+        except Exception:
+            return None, None
+
+    def _resolve_dialog_title(self, dialog_id):
+        try:
+            mc = get_messages_controller()
+            if dialog_id < 0:
+                chat = mc.getChat(-dialog_id)
+                if chat and getattr(chat, "title", None):
+                    return str(chat.title)
+            else:
+                user = mc.getUser(dialog_id)
+                if user:
+                    fn = str(getattr(user, "first_name", "") or "").strip()
+                    ln = str(getattr(user, "last_name", "") or "").strip()
+                    full = f"{fn} {ln}".strip()
+                    if full:
+                        return full
+            DialogObject = find_class("org.telegram.messenger.DialogObject")
+            UserConfig = find_class("org.telegram.messenger.UserConfig")
+            if DialogObject and UserConfig:
+                name = DialogObject.getName(UserConfig.selectedAccount, int(dialog_id))
+                if name:
+                    return str(name)
+        except Exception:
+            pass
+        return f"Chat ({dialog_id})"
+
+    def _install_hooks(self):
+        try:
+            ChatActivityEnterView = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            if ChatActivityEnterView is not None:
+                for m in ChatActivityEnterView.getClass().getDeclaredMethods():
+                    mname = m.getName()
+                    if mname == "setDelegate" and self.hook_enter_delegate_ref is None:
+                        m.setAccessible(True)
+                        self.hook_enter_delegate_ref = self.hook_method(m, EnterViewHook(self))
+                    elif mname == "onAttachedToWindow" and self.hook_enter_attach_ref is None:
+                        m.setAccessible(True)
+                        self.hook_enter_attach_ref = self.hook_method(m, EnterViewHook(self))
+        except Exception:
+            pass
+
+        try:
+            ChatAvatarContainer = find_class("org.telegram.ui.Components.ChatAvatarContainer")
+            if ChatAvatarContainer is not None:
+                for m in ChatAvatarContainer.getClass().getDeclaredMethods():
+                    if m.getName() == "setTitle" and len(m.getParameterTypes()) >= 1:
+                        m.setAccessible(True)
+                        self.hook_avatar_title_ref = self.hook_method(m, AvatarTitleHook(self))
+                        break
+        except Exception:
+            pass
+
+    def _find_enter_view(self, fragment):
+        if fragment is None:
+            return None
+        for fname in ("chatActivityEnterView", "enterView"):
+            try:
+                f = fragment.getClass().getDeclaredField(fname)
+                f.setAccessible(True)
+                val = f.get(fragment)
+                if val is not None:
+                    return val
+            except Exception:
+                pass
+        return None
+
+    def _find_avatar_container(self, fragment):
+        if fragment is None:
+            return None
+        for fname in ("avatarContainer", "chatAvatarContainer"):
+            try:
+                f = fragment.getClass().getDeclaredField(fname)
+                f.setAccessible(True)
+                val = f.get(fragment)
+                if val is not None:
+                    return val
+            except Exception:
+                pass
+        return None
+
+    def _attach_bar_button(self, enter_view):
+        try:
+            if not self.get_setting("show_chat_bar_btn", True):
+                return
+            if enter_view is None or enter_view.findViewWithTag(self._bar_btn_tag) is not None:
+                return
+
+            ctx = enter_view.getContext()
+            if ctx is None:
+                return
+
+            target_layout = None
+            for fname in ("buttonsLayout", "textFieldContainer"):
+                try:
+                    f = enter_view.getClass().getDeclaredField(fname)
+                    f.setAccessible(True)
+                    obj = f.get(enter_view)
+                    if obj is not None:
+                        target_layout = obj
+                        break
+                except Exception:
+                    pass
+
+            if target_layout is None:
+                try:
+                    f_attach = enter_view.getClass().getDeclaredField("attachButton")
+                    f_attach.setAccessible(True)
+                    attach_btn = f_attach.get(enter_view)
+                    if attach_btn is not None:
+                        target_layout = attach_btn.getParent()
+                except Exception:
+                    pass
+
+            if target_layout is None:
+                return
+
+            btn = ImageView(ctx)
+            btn.setTag(self._bar_btn_tag)
+            btn.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+
+            res_id = (
+                self._resolve_drawable_id("msg_archive")
+                or self._resolve_drawable_id("msg_saved")
+                or self._resolve_drawable_id("msg_list")
+            )
+            if res_id:
+                btn.setImageResource(res_id)
+
+            try:
+                selector = Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 1)
+                btn.setBackground(selector)
+            except Exception:
+                pass
+
+            pad = AndroidUtilities.dp(8)
+            btn.setPadding(pad, pad, pad, pad)
+            btn.setOnClickListener(OnClickListener(lambda v: run_on_ui_thread(self._show_main_sheet)))
+
+            lp = LinearLayout.LayoutParams(AndroidUtilities.dp(40), AndroidUtilities.dp(48))
+            lp.gravity = Gravity.BOTTOM
+            target_layout.addView(btn, 0, lp)
+            self._update_button_tint(btn)
+        except Exception:
+            pass
+
+    def _update_button_tint(self, btn):
+        try:
+            if btn is None:
+                return
+            dialog_id, _ = self._get_current_dialog_info()
+            is_marked = self._is_chat_marked(dialog_id)
+            if is_marked:
+                color = Theme.getColor(Theme.key_chat_messagePanelSend)
+            else:
+                color = Theme.getColor(Theme.key_chat_messagePanelIcons)
+            btn.setColorFilter(color)
+        except Exception:
+            pass
+
+    def _apply_header_badge(self, avatar_container):
+        try:
+            if avatar_container is None:
+                return
+            dialog_id, _ = self._get_current_dialog_info()
+            if not dialog_id:
+                return
+            is_marked = self._is_chat_marked(dialog_id)
+
+            title_tv = None
+            for fname in ("titleTextView", "titleView"):
+                try:
+                    f = avatar_container.getClass().getDeclaredField(fname)
+                    f.setAccessible(True)
+                    title_tv = f.get(avatar_container)
+                    if title_tv is not None:
+                        break
+                except Exception:
+                    pass
+
+            if title_tv is None:
+                return
+
+            cur_text = ""
+            try:
+                raw_t = title_tv.getText()
+                cur_text = str(raw_t) if raw_t is not None else ""
+            except Exception:
+                cur_text = ""
+
+            if not cur_text:
+                return
+
+            has_badge = cur_text.startswith(self._badge_prefix)
+            if is_marked and not has_badge:
+                title_tv.setText(self._badge_prefix + cur_text)
+            elif not is_marked and has_badge:
+                title_tv.setText(cur_text[len(self._badge_prefix):])
+        except Exception:
+            pass
+
+    def _refresh_visual_indicators(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            enter_view = self._find_enter_view(fragment)
+            if enter_view is not None:
+                btn = enter_view.findViewWithTag(self._bar_btn_tag)
+                if btn is not None:
+                    self._update_button_tint(btn)
+            avatar_container = self._find_avatar_container(fragment)
+            if avatar_container is not None:
+                self._apply_header_badge(avatar_container)
+        except Exception:
+            pass
+
+    def _send_text_to_dialog(self, dialog_id, text):
+        if not text or not str(text).strip():
+            return False
+        text = str(text)
+        dialog_id = int(dialog_id)
+
+        try:
+            import client_utils
+            if hasattr(client_utils, "send_message"):
+                client_utils.send_message(dialog_id, text)
+                return True
+        except Exception:
+            pass
+
+        try:
+            UserConfig = find_class("org.telegram.messenger.UserConfig")
+            SendMessagesHelper = find_class("org.telegram.messenger.SendMessagesHelper")
+            SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+            if UserConfig and SendMessagesHelper and SendMessageParams:
+                account = UserConfig.selectedAccount
+                helper = SendMessagesHelper.getInstance(account)
+
+                target_method = None
+                for m in SendMessageParams.getClass().getDeclaredMethods():
+                    if m.getName() == "of":
+                        ptypes = m.getParameterTypes()
+                        if len(ptypes) >= 2:
+                            p0 = str(ptypes[0].getName())
+                            p1 = str(ptypes[1].getName())
+                            if "String" in p0 and (p1 == "long" or "Long" in p1):
+                                target_method = m
+                                break
+
+                if target_method is not None:
+                    ptypes = target_method.getParameterTypes()
+                    args = []
+                    for idx, pt in enumerate(ptypes):
+                        pname = str(pt.getName())
+                        if idx == 0:
+                            args.append(text)
+                        elif idx == 1:
+                            args.append(dialog_id)
+                        elif pname == "boolean":
+                            args.append(True if idx in (5, 9) else False)
+                        elif pname == "int":
+                            args.append(0)
+                        elif pname == "long":
+                            args.append(0)
+                        else:
+                            args.append(None)
+
+                    params = target_method.invoke(None, args)
+                    helper.sendMessage(params)
+                    return True
+        except Exception as e:
+            try:
+                BulletinHelper.show_error(f"Gagal kirim ke {dialog_id}: {e}")
+            except Exception:
+                pass
+        return False
+
+    def create_settings(self):
+        return [
+            Divider(text="Tampilan"),
+            Switch(
+                key="show_chat_bar_btn",
+                text="Tampilkan tombol di bar ketik chat",
+                subtext="Tombol menyala saat room ditandai",
+                icon="msg_archive",
+                default=self.get_setting("show_chat_bar_btn", True)
+            ),
+            Divider(text="Akses Cepat"),
+            Text(
+                text="Buka Menu Draft & Broadcast",
+                icon="msg_archive",
+                accent=True,
+                on_click=lambda v: run_on_ui_thread(self._show_main_sheet)
+            ),
+            Text(
+                text="Kelola Chat & Grup Ditandai",
+                icon="msg_pin",
+                on_click=lambda v: run_on_ui_thread(self._show_marked_chats_sheet)
+            ),
+            Input(
+                key="broadcast_delay_ms",
+                text="Jeda kirim broadcast (ms)",
+                icon="msg_recent",
+                default=self.get_setting("broadcast_delay_ms", "1000")
+            ),
+        ]
+
+    def on_plugin_load(self):
+        try:
+            self.add_on_send_message_hook()
+        except Exception:
+            pass
+
+        self._install_hooks()
+
+        try:
+            self.menu_draft_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Draft & Broadcast",
+                icon="msg_archive",
+                priority=1,
+                on_click=lambda ctx: run_on_ui_thread(self._show_main_sheet)
+            ))
+        except Exception:
+            pass
+
+        try:
+            self.ctx_save_draft_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Simpan ke Draft",
+                icon="msg_archive",
+                on_click=lambda ctx: run_on_ui_thread(lambda: self._save_message_context_to_draft(ctx))
+            ))
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        for ref in (self.hook_enter_delegate_ref, self.hook_enter_attach_ref, self.hook_avatar_title_ref):
+            if ref is not None:
+                try:
+                    self.unhook_method(ref)
+                except Exception:
+                    pass
+        for mid in (self.menu_draft_id, self.ctx_save_draft_id):
+            if mid:
+                try:
+                    self.remove_menu_item(mid)
+                except Exception:
+                    pass
+
+    def on_send_message_hook(self, account, params) -> HookResult:
+        try:
+            if not hasattr(params, "message") or not isinstance(params.message, str):
+                return HookResult()
+            msg = params.message.strip().lower()
+            if msg == ".draft":
+                run_on_ui_thread(self._show_main_sheet)
+                return HookResult(strategy=HookStrategy.CANCEL, params=params)
+        except Exception:
+            pass
+        return HookResult()
+
+    def _toggle_mark_current_chat(self):
+        dialog_id, title = self._get_current_dialog_info()
+        if not dialog_id:
+            BulletinHelper.show_error("Buka room chat atau grup terlebih dahulu.")
+            return False
+
+        marked = self._get_marked_chats()
+        exists = False
+        new_list = []
+        for item in marked:
+            if str(item.get("id")) == str(dialog_id):
+                exists = True
+            else:
+                new_list.append(item)
+
+        if exists:
+            self._save_marked_chats(new_list)
+            BulletinHelper.show_info(f"Tanda dihapus: {title}")
+        else:
+            new_list.append({"id": int(dialog_id), "title": title})
+            self._save_marked_chats(new_list)
+            BulletinHelper.show_success(f"Room ditandai: {title}")
+
+        self._refresh_visual_indicators()
+        return True
+
+    def _save_message_context_to_draft(self, ctx):
+        try:
+            msg = None
+            if ctx:
+                msg = ctx.get("message") or ctx.get("message_object") or ctx.get("msg")
+            if not msg:
+                return
+            txt = None
+            try:
+                txt = getattr(msg.messageOwner, "message", None)
+            except Exception:
+                pass
+            if not txt:
+                try:
+                    txt = getattr(msg, "messageText", None)
+                except Exception:
+                    pass
+            if not txt:
+                try:
+                    txt = msg.getMessageText()
+                except Exception:
+                    pass
+            txt = str(txt or "").strip()
+            if not txt:
+                BulletinHelper.show_error("Pesan tidak memiliki teks.")
+                return
+
+            first_line = txt.splitlines()[0][:28]
+            self._open_draft_editor_dialog(edit_index=None, initial_title=first_line, initial_text=txt)
+        except Exception:
+            pass
+
+    def _execute_send_draft(self, draft_text):
+        marked = self._get_marked_chats()
+        current_id, _ = self._get_current_dialog_info()
+
+        if self._broadcast_to_marked:
+            if not marked:
+                BulletinHelper.show_error("Belum ada chat atau grup yang ditandai.")
+                return
+
+            try:
+                delay_ms = int(self.get_setting("broadcast_delay_ms", "1000") or 1000)
+            except Exception:
+                delay_ms = 1000
+            delay_ms = max(250, delay_ms)
+
+            total = len(marked)
+            BulletinHelper.show_info(f"Mengirim draft ke {total} room ditandai...")
+
+            for idx, target in enumerate(marked):
+                tid = int(target.get("id"))
+
+                def make_sender(target_id, is_last, count):
+                    def _send():
+                        self._send_text_to_dialog(target_id, draft_text)
+                        if is_last:
+                            BulletinHelper.show_success(f"Terkirim ke {count} room ditandai.")
+                    return _send
+
+                run_on_ui_thread(make_sender(tid, idx == total - 1, total), delay=idx * delay_ms)
+        else:
+            if not current_id:
+                BulletinHelper.show_error("Buka room chat terlebih dahulu.")
+                return
+            if self._send_text_to_dialog(current_id, draft_text):
+                BulletinHelper.show_success("Draft terkirim ke room ini.")
+
+    def _make_card_bg(self, corner_dp=10, color_override=None):
+        bg = GradientDrawable()
+        bg.setShape(GradientDrawable.RECTANGLE)
+        if color_override is not None:
+            bg.setColor(color_override)
+        else:
+            try:
+                bg.setColor(Theme.getColor(Theme.key_windowBackgroundGray))
+            except Exception:
+                bg.setColor(0x18888888)
+        bg.setCornerRadius(float(AndroidUtilities.dp(corner_dp)))
+        return bg
+
+    def _show_main_sheet(self):
+        fragment = get_last_fragment()
+        ctx = fragment.getParentActivity() if fragment else None
+        if not ctx:
+            return
+
+        self._refresh_visual_indicators()
+        sheet = BottomSheet(ctx, False)
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(16)
+        root.setPadding(pad, AndroidUtilities.dp(12), pad, pad)
+
+        header_row = LinearLayout(ctx)
+        header_row.setOrientation(LinearLayout.HORIZONTAL)
+        header_row.setGravity(Gravity.CENTER_VERTICAL)
+
+        title_tv = TextView(ctx)
+        title_tv.setText("Draft & Broadcast")
+        title_tv.setTextSize(18)
+        try:
+            title_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        except Exception:
+            pass
+        header_row.addView(title_tv, LayoutHelper.createLinear(-1, -2, 1.0))
+
+        btn_add = TextView(ctx)
+        btn_add.setText("+ Draft Baru")
+        btn_add.setTextSize(14)
+        btn_add.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(6), AndroidUtilities.dp(12), AndroidUtilities.dp(6))
+        try:
+            btn_add.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+        except Exception:
+            pass
+        btn_add.setBackground(self._make_card_bg(8))
+        btn_add.setOnClickListener(OnClickListener(lambda v: (
+            sheet.dismiss(),
+            self._open_draft_editor_dialog(edit_index=None)
+        )))
+        header_row.addView(btn_add, LayoutHelper.createLinear(-2, -2))
+        root.addView(header_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        cur_id, cur_title = self._get_current_dialog_info()
+        if cur_id:
+            is_marked = self._is_chat_marked(cur_id)
+            room_card = LinearLayout(ctx)
+            room_card.setOrientation(LinearLayout.HORIZONTAL)
+            room_card.setGravity(Gravity.CENTER_VERTICAL)
+            room_card.setBackground(self._make_card_bg(10))
+            rpad = AndroidUtilities.dp(12)
+            room_card.setPadding(rpad, rpad, rpad, rpad)
+
+            room_info = LinearLayout(ctx)
+            room_info.setOrientation(LinearLayout.VERTICAL)
+
+            room_name_tv = TextView(ctx)
+            room_name_tv.setText(cur_title)
+            room_name_tv.setTextSize(14)
+            room_name_tv.setSingleLine(True)
+            try:
+                room_name_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            except Exception:
+                pass
+            room_info.addView(room_name_tv, LayoutHelper.createLinear(-1, -2))
+
+            status_tv = TextView(ctx)
+            status_tv.setText("📌 Status: Room Ditandai" if is_marked else "Status: Belum Ditandai")
+            status_tv.setTextSize(12)
+            if is_marked:
+                status_tv.setTextColor(0xFF2E7D32)
+            else:
+                try:
+                    status_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                except Exception:
+                    pass
+            room_info.addView(status_tv, LayoutHelper.createLinear(-1, -2))
+            room_card.addView(room_info, LayoutHelper.createLinear(-1, -2, 1.0))
+
+            btn_mark_toggle = TextView(ctx)
+            btn_mark_toggle.setText("Hapus Tanda" if is_marked else "Tandai Room")
+            btn_mark_toggle.setTextSize(13)
+            btn_mark_toggle.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(7), AndroidUtilities.dp(12), AndroidUtilities.dp(7))
+            btn_mark_toggle.setTextColor(0xFFFFFFFF)
+            btn_mark_toggle.setBackground(
+                self._make_card_bg(8, 0xFFE53935 if is_marked else 0xFF2196F3)
+            )
+            btn_mark_toggle.setOnClickListener(OnClickListener(lambda v: (
+                self._toggle_mark_current_chat(),
+                sheet.dismiss(),
+                self._show_main_sheet()
+            )))
+            room_card.addView(btn_mark_toggle, LayoutHelper.createLinear(-2, -2))
+            root.addView(room_card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        marked_chats = self._get_marked_chats()
+        broadcast_row = LinearLayout(ctx)
+        broadcast_row.setOrientation(LinearLayout.HORIZONTAL)
+        broadcast_row.setGravity(Gravity.CENTER_VERTICAL)
+
+        cb_broadcast = CheckBox(ctx)
+        cb_broadcast.setText(f"Kirim ke semua ditandai ({len(marked_chats)})")
+        cb_broadcast.setChecked(bool(self._broadcast_to_marked))
+        try:
+            cb_broadcast.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        except Exception:
+            pass
+        cb_broadcast.setOnClickListener(OnClickListener(
+            lambda v: setattr(self, "_broadcast_to_marked", bool(cb_broadcast.isChecked()))
+        ))
+        broadcast_row.addView(cb_broadcast, LayoutHelper.createLinear(-1, -2, 1.0))
+
+        btn_list_marks = TextView(ctx)
+        btn_list_marks.setText(f"Daftar ({len(marked_chats)})")
+        btn_list_marks.setTextSize(13)
+        btn_list_marks.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(6), AndroidUtilities.dp(10), AndroidUtilities.dp(6))
+        btn_list_marks.setBackground(self._make_card_bg(8))
+        try:
+            btn_list_marks.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+        except Exception:
+            pass
+        btn_list_marks.setOnClickListener(OnClickListener(lambda v: (
+            sheet.dismiss(),
+            self._show_marked_chats_sheet()
+        )))
+        broadcast_row.addView(btn_list_marks, LayoutHelper.createLinear(-2, -2))
+        root.addView(broadcast_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        scroll = ScrollView(ctx)
+        list_container = LinearLayout(ctx)
+        list_container.setOrientation(LinearLayout.VERTICAL)
+
+        drafts = self._get_drafts()
+        if not drafts:
+            empty_tv = TextView(ctx)
+            empty_tv.setText("Belum ada draft tersimpan.
+Tekan '+ Draft Baru' untuk menambahkan.")
+            empty_tv.setTextSize(14)
+            empty_tv.setPadding(0, AndroidUtilities.dp(24), 0, AndroidUtilities.dp(24))
+            try:
+                empty_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            except Exception:
+                pass
+            list_container.addView(empty_tv, LayoutHelper.createLinear(-1, -2))
+        else:
+            for idx, d in enumerate(drafts):
+                d_title = str(d.get("title") or f"Draft #{idx + 1}")
+                d_text = str(d.get("text") or "")
+
+                card = LinearLayout(ctx)
+                card.setOrientation(LinearLayout.VERTICAL)
+                card.setBackground(self._make_card_bg(10))
+                cpad = AndroidUtilities.dp(12)
+                card.setPadding(cpad, cpad, cpad, cpad)
+
+                top_row = LinearLayout(ctx)
+                top_row.setOrientation(LinearLayout.HORIZONTAL)
+                top_row.setGravity(Gravity.CENTER_VERTICAL)
+
+                t_view = TextView(ctx)
+                t_view.setText(d_title)
+                t_view.setTextSize(15)
+                try:
+                    t_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                except Exception:
+                    pass
+                top_row.addView(t_view, LayoutHelper.createLinear(-1, -2, 1.0))
+
+                btn_edit = TextView(ctx)
+                btn_edit.setText("Edit")
+                btn_edit.setTextSize(13)
+                btn_edit.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(4), AndroidUtilities.dp(10), AndroidUtilities.dp(4))
+                try:
+                    btn_edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+                except Exception:
+                    pass
+
+                def make_edit_fn(i):
+                    def _fn(v):
+                        sheet.dismiss()
+                        self._open_draft_editor_dialog(edit_index=i)
+                    return _fn
+
+                btn_edit.setOnClickListener(OnClickListener(make_edit_fn(idx)))
+                top_row.addView(btn_edit, LayoutHelper.createLinear(-2, -2))
+
+                btn_del = TextView(ctx)
+                btn_del.setText("Hapus")
+                btn_del.setTextSize(13)
+                btn_del.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4))
+                btn_del.setTextColor(0xFFE53935)
+
+                def make_del_fn(i):
+                    def _fn(v):
+                        cur = self._get_drafts()
+                        if 0 <= i < len(cur):
+                            cur.pop(i)
+                            self._save_drafts(cur)
+                            BulletinHelper.show_info("Draft dihapus.")
+                        sheet.dismiss()
+                        self._show_main_sheet()
+                    return _fn
+
+                btn_del.setOnClickListener(OnClickListener(make_del_fn(idx)))
+                top_row.addView(btn_del, LayoutHelper.createLinear(-2, -2))
+                card.addView(top_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 4))
+
+                preview_tv = TextView(ctx)
+                preview_tv.setText(d_text)
+                preview_tv.setTextSize(13)
+                preview_tv.setMaxLines(4)
+                try:
+                    preview_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                except Exception:
+                    pass
+                card.addView(preview_tv, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 8))
+
+                btn_send = TextView(ctx)
+                btn_send.setText("Kirim Pesan Ini")
+                btn_send.setTextSize(14)
+                btn_send.setGravity(Gravity.CENTER)
+                btn_send.setPadding(0, AndroidUtilities.dp(8), 0, AndroidUtilities.dp(8))
+                try:
+                    btn_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+                except Exception:
+                    btn_color = 0xFF2196F3
+                btn_send.setBackground(self._make_card_bg(8, btn_color))
+                btn_send.setTextColor(0xFFFFFFFF)
+
+                def make_send_fn(txt_to_send):
+                    def _fn(v):
+                        self._broadcast_to_marked = bool(cb_broadcast.isChecked())
+                        sheet.dismiss()
+                        self._execute_send_draft(txt_to_send)
+                    return _fn
+
+                btn_send.setOnClickListener(OnClickListener(make_send_fn(d_text)))
+                card.addView(btn_send, LayoutHelper.createLinear(-1, -2))
+
+                list_container.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        scroll.addView(list_container, LayoutHelper.createFrame(-1, -2))
+        root.addView(scroll, LayoutHelper.createLinear(-1, AndroidUtilities.dp(380)))
+
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _open_draft_editor_dialog(self, edit_index=None, initial_title="", initial_text=""):
+        fragment = get_last_fragment()
+        ctx = fragment.getParentActivity() if fragment else None
+        if not ctx:
+            return
+
+        drafts = self._get_drafts()
+        if edit_index is not None and 0 <= edit_index < len(drafts):
+            initial_title = str(drafts[edit_index].get("title") or "")
+            initial_text = str(drafts[edit_index].get("text") or "")
+
+        builder = AlertDialogBuilder(ctx)
+        builder.set_title("Edit Draft" if edit_index is not None else "Tambah Draft Baru")
+
+        box = LinearLayout(ctx)
+        box.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(16)
+        box.setPadding(pad, AndroidUtilities.dp(8), pad, AndroidUtilities.dp(8))
+
+        title_input = EditText(ctx)
+        title_input.setHint("Judul draft")
+        title_input.setText(initial_title)
+        try:
+            title_input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            title_input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+        except Exception:
+            pass
+        box.addView(title_input, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        text_input = EditText(ctx)
+        text_input.setHint("Isi pesan draft...")
+        text_input.setText(initial_text)
+        text_input.setMinLines(4)
+        text_input.setGravity(Gravity.TOP | Gravity.START)
+        try:
+            text_input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            text_input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+        except Exception:
+            pass
+        box.addView(text_input, LayoutHelper.createLinear(-1, -2))
+
+        builder.set_view(box)
+
+        def _on_save(d, w):
+            t_val = str(title_input.getText().toString() or "").strip()
+            m_val = str(text_input.getText().toString() or "").strip()
+            if not m_val:
+                BulletinHelper.show_error("Isi pesan draft tidak boleh kosong.")
+                return
+            if not t_val:
+                t_val = m_val.splitlines()[0][:25]
+
+            cur = self._get_drafts()
+            if edit_index is not None and 0 <= edit_index < len(cur):
+                cur[edit_index] = {"title": t_val, "text": m_val}
+                BulletinHelper.show_success("Draft diperbarui.")
+            else:
+                cur.append({"title": t_val, "text": m_val})
+                BulletinHelper.show_success("Draft ditambahkan.")
+            self._save_drafts(cur)
+            d.dismiss()
+            self._show_main_sheet()
+
+        builder.set_positive_button("Simpan", _on_save)
+        builder.set_negative_button("Batal", lambda d, w: (d.dismiss(), self._show_main_sheet()))
+        builder.show()
+
+    def _show_marked_chats_sheet(self):
+        fragment = get_last_fragment()
+        ctx = fragment.getParentActivity() if fragment else None
+        if not ctx:
+            return
+
+        sheet = BottomSheet(ctx, False)
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(16)
+        root.setPadding(pad, AndroidUtilities.dp(12), pad, pad)
+
+        title_tv = TextView(ctx)
+        title_tv.setText("Daftar Chat & Grup Ditandai")
+        title_tv.setTextSize(18)
+        try:
+            title_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        except Exception:
+            pass
+        root.addView(title_tv, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+        scroll = ScrollView(ctx)
+        list_box = LinearLayout(ctx)
+        list_box.setOrientation(LinearLayout.VERTICAL)
+
+        marked = self._get_marked_chats()
+        if not marked:
+            empty_tv = TextView(ctx)
+            empty_tv.setText("Belum ada chat atau grup yang ditandai.")
+            empty_tv.setTextSize(14)
+            empty_tv.setPadding(0, AndroidUtilities.dp(20), 0, AndroidUtilities.dp(20))
+            try:
+                empty_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            except Exception:
+                pass
+            list_box.addView(empty_tv, LayoutHelper.createLinear(-1, -2))
+        else:
+            for idx, item in enumerate(marked):
+                cid = item.get("id")
+                cname = str(item.get("title") or f"Chat {cid}")
+
+                row = LinearLayout(ctx)
+                row.setOrientation(LinearLayout.HORIZONTAL)
+                row.setGravity(Gravity.CENTER_VERTICAL)
+                row.setBackground(self._make_card_bg(8))
+                rpad = AndroidUtilities.dp(10)
+                row.setPadding(rpad, rpad, rpad, rpad)
+
+                info_tv = TextView(ctx)
+                info_tv.setText(f"📌 {cname}
+ID: {cid}")
+                info_tv.setTextSize(14)
+                try:
+                    info_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                except Exception:
+                    pass
+                row.addView(info_tv, LayoutHelper.createLinear(-1, -2, 1.0))
+
+                btn_rm = TextView(ctx)
+                btn_rm.setText("Hapus")
+                btn_rm.setTextSize(13)
+                btn_rm.setTextColor(0xFFE53935)
+                btn_rm.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4))
+
+                def make_rm_fn(i):
+                    def _fn(v):
+                        cur = self._get_marked_chats()
+                        if 0 <= i < len(cur):
+                            cur.pop(i)
+                            self._save_marked_chats(cur)
+                        self._refresh_visual_indicators()
+                        sheet.dismiss()
+                        self._show_marked_chats_sheet()
+                    return _fn
+
+                btn_rm.setOnClickListener(OnClickListener(make_rm_fn(idx)))
+                row.addView(btn_rm, LayoutHelper.createLinear(-2, -2))
+                list_box.addView(row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 8))
+
+        scroll.addView(list_box, LayoutHelper.createFrame(-1, -2))
+        root.addView(scroll, LayoutHelper.createLinear(-1, AndroidUtilities.dp(340)))
+
+        btn_back = TextView(ctx)
+        btn_back.setText("← Kembali")
+        btn_back.setTextSize(14)
+        btn_back.setGravity(Gravity.CENTER)
+        btn_back.setPadding(0, AndroidUtilities.dp(10), 0, AndroidUtilities.dp(4))
+        try:
+            btn_back.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+        except Exception:
+            pass
+        btn_back.setOnClickListener(OnClickListener(lambda v: (
+            sheet.dismiss(),
+            self._show_main_sheet()
+        )))
+        root.addView(btn_back, LayoutHelper.createLinear(-1, -2))
+
+        sheet.setCustomView(root)
+        sheet.show()
